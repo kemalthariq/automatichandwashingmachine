@@ -1,0 +1,396 @@
+#include <Arduino.h>
+#include <Ultrasonic.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <FS.h>
+#include <SD.h>
+#include <JPEGDecoder.h>
+#include <Adafruit_MLX90614.h>
+#include <DFRobotDFPlayerMini.h>
+#include <FirebaseESP32.h>
+
+FirebaseData firebaseData;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+TFT_eSPI tft = TFT_eSPI();
+char buffer[100];
+
+// Firebase
+#define FIREBASE_HOST ""
+#define FIREBASE_AUTH ""
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Pin Sensors
+#define pinsensor1 13
+#define relay1 14
+#define pinsensor2 12
+#define relay2 27
+#define pinsensor3 25
+#define relay3 26
+Ultrasonic ultrasonic1(33, 35);
+Ultrasonic ultrasonic2(32, 34);
+
+int distance, waterlevel, sensor1, sensor2, sensor3;
+int i = 0;
+int state = 0;
+int aktu = 0;
+float Object;
+String suhu, dataPost;
+DFRobotDFPlayerMini mp3;
+uint32_t mcu_pixels;
+
+void printDetail(uint8_t type, int value);
+void showTime(uint32_t msTime);
+void jpegRender(int xpos, int ypos);
+void drawSdJpeg(const char *filename, int xpos, int ypos);
+void jpegInfo();
+void Sensor();
+
+void IRAM_ATTR Ext_INT1_ISR()
+{
+  if (aktu == 1)
+  {
+    sensor1 = digitalRead(pinsensor1);
+    if (sensor1 == LOW)
+    {
+      digitalWrite(relay1, HIGH);
+    }
+    if (sensor1 == HIGH)
+    {
+      digitalWrite(relay1, LOW);
+    }
+
+    sensor2 = digitalRead(pinsensor2);
+    if (sensor2 == LOW)
+    {
+      digitalWrite(relay2, HIGH);
+    }
+    if (sensor2 == HIGH)
+    {
+      digitalWrite(relay2, LOW);
+    }
+
+    sensor3 = digitalRead(pinsensor3);
+    if (sensor3 == LOW)
+    {
+      digitalWrite(relay3, HIGH);
+    }
+    if (sensor3 == HIGH)
+    {
+      digitalWrite(relay3, LOW);
+    }
+  } 
+}
+
+void setup()
+{
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  Serial2.begin(9600);
+
+  tft.init();
+  tft.setRotation(1);
+  mlx.begin();
+
+  // Set all chip selects high to avoid bus contention during initialisation of each peripheral
+  digitalWrite(22, HIGH); // Touch controller chip select (if used)
+  digitalWrite(15, HIGH); // TFT screen chip select
+  digitalWrite(5, HIGH);  // SD card chips select, must use GPIO 5 (ESP32 SS)
+  tft.begin();
+
+  //Firebase Connect To Wifi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Firebase.reconnectWiFi(true);
+
+  if (!mp3.begin(Serial2))
+  {
+    Serial.println(F("Unable to begin"));
+  }
+
+  mp3.volume(100);
+  if (!SD.begin())
+  {
+    Serial.println("Card Mount Failed");
+    return;
+  }
+  uint8_t cardType = SD.cardType();
+
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("No SD card attached");
+    return;
+  }
+
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+  Serial.println("initialisation done.");
+
+  pinMode(pinsensor1, INPUT);
+  pinMode(relay1, OUTPUT);
+  attachInterrupt(pinsensor1, Ext_INT1_ISR, CHANGE);
+
+  pinMode(pinsensor2, INPUT);
+  pinMode(relay2, OUTPUT);
+  attachInterrupt(pinsensor2, Ext_INT1_ISR, CHANGE);
+
+  pinMode(pinsensor3, INPUT);
+  pinMode(relay3, OUTPUT);
+  attachInterrupt(pinsensor3, Ext_INT1_ISR, CHANGE);
+}
+
+void loop()
+{
+  Object = mlx.readObjectTempC() + 5;
+  sprintf(buffer, "%.1f", Object);
+  distance = ultrasonic1.read();
+  waterlevel = ultrasonic2.read();
+
+  if (distance < 15)
+  {
+    tft.setRotation(1); // landscape
+    tft.fillScreen(random(0xFFFF));
+    drawSdJpeg("/4.jpg", 0, 0); // This draws a jpeg pulled off the SD Card
+    tft.setCursor(85, 150);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextSize(4);
+    tft.print(Object);
+    tft.println(" Celcius");
+    tft.println();
+    Serial.print(Object);
+    Serial.println();
+
+    i++;
+    dataPost = "Suhu" + (String(i));
+    suhu = "/Object/" + dataPost + "/suhu";
+    Firebase.setString(firebaseData, suhu, buffer);
+    Firebase.setInt(firebaseData, "/Amount/count", i);
+    delay(5000);
+    mp3.play(1);
+
+    tft.setRotation(1); // landscape
+    tft.fillScreen(random(0xFFFF));
+    drawSdJpeg("/6.jpg", 0, 0);
+    aktu = 1;
+    delay(30000);
+    state = 0;
+  }
+
+  else if (state == 0)
+  {
+    tft.setRotation(1); // portrait
+    tft.fillScreen(random(0xFFFF));
+    mp3.stop();
+    drawSdJpeg("/3.jpg", 0, 0);
+    delay(2000);
+    state = 1;
+    aktu = 0;
+  }
+  
+  waterlevel = map(waterlevel, 30, 60, 100, 0);
+  Serial.println(waterlevel);
+  Firebase.setInt(firebaseData, "/LevelAir", waterlevel);
+
+  if (Firebase.getString(firebaseData, "/Water/state"))
+  {
+    if (firebaseData.dataType() == "string")
+    {
+      String FBStatus = firebaseData.stringData();
+      if (FBStatus == "on")
+      {
+        Serial.println("AIR ON");
+        digitalWrite(relay1, HIGH);
+      }
+      else if (FBStatus == "off")
+      {
+        Serial.println("AIR OFF");
+        digitalWrite(relay1, LOW);
+      }
+      else
+      {
+        Serial.println("Salah kode! isi dengan data ON/OFF");
+      }
+    }
+  }
+
+  if (Firebase.getString(firebaseData, "/Soap/state"))
+  {
+    if (firebaseData.dataType() == "string")
+    {
+      String FBStatus = firebaseData.stringData();
+      if (FBStatus == "on")
+      {
+        Serial.println("SABUN ON");
+        digitalWrite(relay2, HIGH);
+      }
+      else if (FBStatus == "off")
+      {
+        Serial.println("SABUN OFF");
+        digitalWrite(relay2, LOW);
+      }
+      else
+      {
+        Serial.println("Salah kode! isi dengan data ON/OFF");
+      }
+    }
+  }
+
+  if (Firebase.getString(firebaseData, "/Heater/state"))
+  {
+    if (firebaseData.dataType() == "string")
+    {
+      String FBStatus = firebaseData.stringData();
+      if (FBStatus == "on")
+      {
+        Serial.println("HEATER ON");
+        digitalWrite(relay3, HIGH);
+      }
+      else if (FBStatus == "off")
+      {
+        Serial.println("HEATER OFF");
+        digitalWrite(relay3, LOW);
+      }
+      else
+      {
+        Serial.println("Salah kode! isi dengan data ON/OFF");
+      }
+    }
+  }
+}
+
+// Draw a JPEG on the TFT pulled from SD Card
+void drawSdJpeg(const char *filename, int xpos, int ypos)
+{
+  // Open the named file (the Jpeg decoder library will close it)
+  File jpegFile = SD.open(filename, FILE_READ); // or, file handle reference for SD library
+
+  if (!jpegFile)
+  {
+    Serial.print("ERROR: File \"");
+    Serial.print(filename);
+    Serial.println("\" not found!");
+    return;
+  }
+
+  Serial.print("Drawing file: ");
+  Serial.println(filename);
+
+  // Use one of the following methods to initialise the decoder:
+  boolean decoded = JpegDec.decodeSdFile(jpegFile); // Pass the SD file handle to the decoder,
+
+  if (decoded)
+  {
+    // print information about the image to the serial port
+    jpegInfo();
+    // render the image onto the screen at given coordinates
+    jpegRender(xpos, ypos);
+  }
+  else
+  {
+    Serial.println("Jpeg file format not supported!");
+  }
+}
+
+// Print image information to the serial port (optional)
+void jpegInfo()
+{
+}
+
+// Draw a JPEG on the TFT, images will be cropped on the right/bottom sides if they do not fit
+void jpegRender(int xpos, int ypos)
+{
+  //jpegInfo(); // Print information from the JPEG file (could comment this line out)
+  uint16_t *pImg;
+  uint16_t mcu_w = JpegDec.MCUWidth;
+  uint16_t mcu_h = JpegDec.MCUHeight;
+  uint32_t max_x = JpegDec.width;
+  uint32_t max_y = JpegDec.height;
+
+  bool swapBytes = tft.getSwapBytes();
+  tft.setSwapBytes(true);
+
+  // Jpeg images are draw as a set of image block (tiles) called Minimum Coding Units (MCUs)
+  uint32_t min_w = jpg_min(mcu_w, max_x % mcu_w);
+  uint32_t min_h = jpg_min(mcu_h, max_y % mcu_h);
+
+  // save the current image block size
+  uint32_t win_w = mcu_w;
+  uint32_t win_h = mcu_h;
+
+  // record the current time so we can measure how long it takes to draw an image
+  uint32_t drawTime = millis();
+
+  // save the coordinate of the right and bottom edges to assist image cropping
+  max_x += xpos;
+  max_y += ypos;
+
+  // Fetch data from the file, decode and display
+  while (JpegDec.read())
+  {
+    pImg = JpegDec.pImage; // Decode a MCU (Minimum Coding Unit, typically a 8x8 or 16x16 pixel block)
+
+    // Calculate coordinates of top left corner of current MCU
+    int mcu_x = JpegDec.MCUx * mcu_w + xpos;
+    int mcu_y = JpegDec.MCUy * mcu_h + ypos;
+
+    // check if the image block size needs to be changed for the right edge
+    if (mcu_x + mcu_w <= max_x)
+      win_w = mcu_w;
+    else
+      win_w = min_w;
+
+    // check if the image block size needs to be changed for the bottom edge
+    if (mcu_y + mcu_h <= max_y)
+      win_h = mcu_h;
+    else
+      win_h = min_h;
+
+    // copy pixels into a contiguous block
+    if (win_w != mcu_w)
+    {
+      uint16_t *cImg;
+      int p = 0;
+      cImg = pImg + win_w;
+      for (int h = 1; h < win_h; h++)
+      {
+        p += mcu_w;
+        for (int w = 0; w < win_w; w++)
+        {
+          *cImg = *(pImg + w + p);
+          cImg++;
+        }
+      }
+    }
+
+    // calculate how many pixels must be drawn
+    mcu_pixels = win_w * win_h;
+
+    // draw image MCU block only if it will fit on the screen
+    if ((mcu_x + win_w) <= tft.width() && (mcu_y + win_h) <= tft.height())
+      tft.pushImage(mcu_x, mcu_y, win_w, win_h, pImg);
+    else if ((mcu_y + win_h) >= tft.height())
+      JpegDec.abort(); // Image has run off bottom of screen so abort decoding
+  }
+
+  tft.setSwapBytes(swapBytes);
+  showTime(millis() - drawTime); // These lines are for sketch testing only
+}
+
+// Show the execution time (optional)
+void showTime(uint32_t msTime)
+{
+  Serial.print(msTime);
+  Serial.println(F(" ms "));
+}
